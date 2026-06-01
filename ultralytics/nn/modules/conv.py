@@ -21,6 +21,7 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
+    "DConv"
 )
 
 
@@ -331,3 +332,20 @@ class Concat(nn.Module):
     def forward(self, x):
         """Forward pass for the YOLOv8 mask Proto module."""
         return torch.cat(x, self.d)
+
+class Dconv(nn.Module):
+    def __init__(self, in_channels, out_channels, ksize, stride=1, act="silu"):
+        super().__init__()
+        self.row_conv = Conv(c1=in_channels, c2=out_channels, k=(ksize, 1), stride=stride, act=act)
+        self.col_conv = Conv(c1=in_channels, c2=out_channels, k=(1, ksize), stride=stride, act=act)
+        # self.row_conv = Conv(in_channels, out_channels, ksize=(ksize, 1), stride=stride, act=act)
+        # self.col_conv = Conv(in_channels, out_channels, ksize=(1, ksize), stride=stride, act=act)
+
+        self.conv_fusion = DWConv(out_channels * 2, out_channels, ksize=1, stride=1, act=act)
+    def forward(self, x):
+        row_out = self.row_conv(x)
+        col_out = self.col_conv(x)
+        # print(f"row_out shape: {row_out.shape}, col_out shape: {col_out.shape}")
+        # print(x.shape)
+        out = torch.cat([row_out, col_out], dim=1)
+        return self.conv_fusion(out)

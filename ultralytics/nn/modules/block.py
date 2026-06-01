@@ -4,11 +4,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from mamba_ssm import Mamba
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad, Dconv
 from .transformer import TransformerBlock
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
-
+from pytorch_wavelets import DWTForward, DWTInverse
 __all__ = (
     "DFL",
     "HGBlock",
@@ -38,9 +38,560 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "Silence",
+    "FSSB",
+    "CARAFEPlus",
+    "UpFuseBlockV2"
+    "SplitFreq",
+    "SobelConv",
+    "FreqASFF"
 )
+class SobelConv(nn.Module):
+    """
+    SobelConv: 可学习的Sobel卷积层
+    用于提取图像的边缘、轮廓等高维特征
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(SobelConv, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+        # 定义Sobel卷积核（水平和垂直方向）
+        sobel_kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        
+        # 将Sobel核扩展为可学习的卷积权重
+        self.weight_x = nn.Parameter(sobel_kernel_x.view(1, 1, 3, 3).repeat(out_channels, in_channels, 1, 1))
+        self.weight_y = nn.Parameter(sobel_kernel_y.view(1, 1, 3, 3).repeat(out_channels, in_channels, 1, 1))
+        
+        # 可选的缩放因子和偏置
+        self.scale = nn.Parameter(torch.ones(1, out_channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+        
+        # 初始化
+        with torch.no_grad():
+            nn.init.kaiming_normal_(self.weight_x, mode='fan_out', nonlinearity='relu')
+            nn.init.kaiming_normal_(self.weight_y, mode='fan_out', nonlinearity='relu')
+        
+    def forward(self, x):
+        # 分别计算x方向和y方向的梯度
+        grad_x = F.conv2d(x, self.weight_x, stride=self.stride, padding=self.padding)
+        grad_y = F.conv2d(x, self.weight_y, stride=self.stride, padding=self.padding)
+        
+        # 合并梯度信息（梯度幅值）
+        edge_feat = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
+        
+        # 缩放和偏置
+        edge_feat = edge_feat * self.scale + self.bias.view(1, -1, 1, 1)
+        
+        return edge_feat
+class ESCFFM(nn.Module):
+    """
+    YOLOv10兼容版本的Bottleneck_ESCFFM
+    """
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3,3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        
+        # 两条并行分支
+        # 分支1：普通卷积（提取语义信息）
+        self.conv_branch = nn.Sequential(
+            Conv(c1, c_, 1, 1),
+            Conv(c_, c_, k, 1, g=g, act=True)  # YOLOv10的Conv参数可能不同
+        )
+        
+        # 分支2：SobelConv（提取边缘/高频信息）
+        self.sobel_branch = nn.Sequential(
+            Conv(c1, c_, 1, 1),
+            Conv(c_, c_, 1, 1)  # 先用1x1降维
+        )
+        self.sobel_conv = SobelConv(c_, c_, k[0] if isinstance(k, tuple) else k, 1, padding=1)
+        
+        # 特征融合层
+        self.fusion = Conv(c_ * 2, c2, 1, 1)
+        
+        self.add = shortcut and c1 == c2
+        
+    def forward(self, x):
+        # 并行提取特征
+        conv_out = self.conv_branch(x)
+        
+        # Sobel分支
+        sobel_feat = self.sobel_branch(x)
+        sobel_out = self.sobel_conv(sobel_feat)
+        
+        # 确保维度匹配
+        if conv_out.shape[1] != sobel_out.shape[1]:
+            # 如果维度不匹配，对sobel_out进行投影
+            if not hasattr(self, 'project'):
+                self.project = Conv(sobel_out.shape[1], conv_out.shape[1], 1, 1)
+            sobel_out = self.project(sobel_out)
+        
+        # 拼接融合
+        fused = self.fusion(torch.cat([conv_out, sobel_out], dim=1))
+        
+        if self.add:
+            fused = x + fused
+        return fused
+
+class MambaBottleneck(nn.Module):
+    def __init__(self, dim, r=1):
+        super().__init__()
+
+        self.dwt = DWTForward(wave='haar')
+
+        # ---------- Residual branch (depthwise stride=2) ----------
+        self.residual = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, stride=2, padding=1, groups=dim, bias=False),
+            nn.Conv2d(dim, dim, 1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU()
+        )
+
+        # ---------- Low-frequency branch (depthwise 3x3) ----------
+        self.low_dw = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU()
+        )
+
+        # ---------- High-frequency reduce ----------
+        self.high_reduce = nn.Sequential(
+            nn.Conv2d(3 * dim, dim, 1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU()
+        )
+
+        # ---------- Extra downsample before Mamba (critical) ----------
+        # self.mamba_down = nn.AvgPool2d(2)
+
+        self.norm = nn.LayerNorm(dim)
+
+        # ---------- Lightweight Mamba ----------
+        self.mambas = nn.ModuleList( Mamba(
+            d_model=dim ,   # 降维
+            d_state=4,          # 更小
+            d_conv=3,
+            expand=1
+        ) for _ in range(r) )
+       
+
+        # ---------- Fusion ----------
+        self.fusion = nn.Sequential(
+            nn.Conv2d(dim + dim, dim, 1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU()
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        # Residual
+        residual = self.residual(x)
+
+        # DWT
+        # with :  # DWT不支持半精度
+        LL, yh = self.dwt(x)
+        LH, HL, HH = yh[0][:, :, 0], yh[0][:, :, 1], yh[0][:, :, 2]
+
+        # Low-frequency
+        low = self.low_dw(LL)
+
+        # High-frequency
+        high = torch.cat([LH, HL, HH], dim=1)
+        high = self.high_reduce(high)
+
+        # ↓↓↓ 关键降低 FLOPs ↓↓↓
+        # high = self.mamba_down(high)  # H/4, W/4
+
+        Bh, Ch, Hh, Wh = high.shape
+
+        high = high.flatten(2).transpose(1, 2)  # B, L, C
+        high = self.norm(high)
+
+        if high.device.type == 'cuda':
+            for mb in self.mambas:
+                high = mb(high)
+
+        high = high.transpose(1, 2).reshape(Bh, Ch, Hh, Wh)
+
+        # 上采样回 LL 尺寸
+        # high = nn.functional.interpolate(high, size=low.shape[-2:], mode='bilinear', align_corners=False)
+
+        out = self.fusion(torch.cat([low, high], dim=1))
+
+        return out + residual
+class FSSB(nn.Module):
+    """FSSB: Fast Spatial Squeeze-and-Excitation Block for YOLOv10 by Glenn Jocher."""
+
+    def __init__(self, c1, c2, r=1, k=3, s=1):
+        """Initializes FSSB module with given input/output channels, kernel size, and stride."""
+        super().__init__()
+        self.conv = DWConv(c1, c2, k, s)
+        self.mamba = MambaBottleneck(c2, r)
 
 
+    def forward(self, x):
+        """Applies skip connection and concatenation to input tensor."""
+        x = self.conv(x)
+        # print(x.shape)
+        out = self.mamba(x)
+        # print(out.shape)
+        return out
+class FreqASFF(nn.Module):
+    def __init__(self, level, in_channels_list, out_channels=None, mid_channels=64):
+        super().__init__()
+        self.level = level
+        self.out_channels = out_channels if out_channels is not None else mid_channels
+        self.weight_conv1 = nn.Conv2d(in_channels_list[0], 1, kernel_size=1)
+        self.weight_conv2 = nn.Conv2d(in_channels_list[1], 1, kernel_size=1)
+        # self.weight_conv3 = nn.Conv2d(in_channels_list[2], 1, kernel_size=1)
+        self.reduce_layers = nn.ModuleList()
+        self.up = UPFusion(in_channels_list[1], in_channels_list[0], in_channels_list[1])
+    
+    def forward(self, x):
+        x1, x2, x_low =  x
+        w1 = self.weight_conv1(x1)
+        w2 = self.weight_conv2(x2)
+        weights = torch.cat([w1, w2], dim=1)
+        weights = F.softmax(weights, dim=1)
+        w1, w2 = weights[:, 0:1], weights[:, 1:2]
+        x2_up = self.up((x2, x_low))
+        out = w1 * x1 + w2 * x2_up
+        # print(out.shape)
+        return out
+        
+class ASFF(nn.Module):
+    def __init__(self, level, in_channels_list, out_channels=None, mid_channels=64):
+        """
+        Args:
+            level: 目标层级 1/2/3
+            in_channels_list: 三个输入通道数 [c1,c2,c3]
+            mid_channels: 降维后的中间通道数（默认128），可进一步调小
+            out_channels: 输出通道数，若为None则保持mid_channels
+        """
+        super().__init__()
+        self.level = level
+        self.mid_channels = min(in_channels_list)
+        self.out_channels = out_channels if out_channels is not None else mid_channels
+
+        # 降维层：分别将三个输入通道降到mid_channels
+        self.reduce_layers = nn.ModuleList()
+        for in_c in in_channels_list:
+            if in_c != mid_channels:
+                self.reduce_layers.append(DWConv(in_c, mid_channels, 1))
+            else:
+                self.reduce_layers.append(nn.Identity())
+
+        # 特征对齐（尺寸调整）——此时通道已统一为mid_channels
+        self.align = nn.ModuleList()
+        target_hw = None  # 将根据目标level动态计算
+        for i, in_c in enumerate(in_channels_list, start=1):
+            align = self._make_align(i, level, mid_channels)
+            self.align.append(align)
+
+        # 权重生成：使用深度可分离卷积进一步降低计算量
+        # 也可以使用普通1x1卷积，但mid_channels较小，开销已不大
+        self.weight_conv1 = nn.Conv2d(mid_channels, 1, kernel_size=1)
+        self.weight_conv2 = nn.Conv2d(mid_channels, 1, kernel_size=1)
+        self.weight_conv3 = nn.Conv2d(mid_channels, 1, kernel_size=1)
+
+        # 如果需要输出通道与mid_channels不同，加一个输出投影
+        if self.out_channels != mid_channels:
+            self.out_proj = DWConv(mid_channels, self.out_channels, 1)
+        else:
+            self.out_proj = nn.Identity()
+
+    def _make_align(self, i, target_level, channels):
+        diff = i - target_level
+        ops = []
+        if diff > 0:  # 下采样
+            for _ in range(diff):
+                ops.extend([
+                    nn.Conv2d(channels, channels, 3, stride=2, padding=1),
+                    nn.BatchNorm2d(channels),
+                    nn.ReLU(inplace=True)
+                ])
+        elif diff < 0:  # 上采样
+            scale = 2 ** (-diff)
+            ops.append(nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False))
+        if len(ops) == 0:
+            return nn.Identity()
+        elif len(ops) == 1:
+            return ops[0]
+        else:
+            return nn.Sequential(*ops)
+ 
+    def forward(self,x):
+
+        x1, x2, x3 =  x
+        # 降维
+        x1 = self.reduce_layers[0](x1)
+        x2 = self.reduce_layers[1](x2)
+        x3 = self.reduce_layers[2](x3)
+
+        # 对齐
+        x1 = self.align[0](x1)
+        x2 = self.align[1](x2)
+        x3 = self.align[2](x3)
+
+        # 生成权重
+        w1 = self.weight_conv1(x1)
+        w2 = self.weight_conv2(x2)
+        w3 = self.weight_conv3(x3)
+        weights = torch.cat([w1, w2, w3], dim=1)
+        weights = F.softmax(weights, dim=1)
+        w1, w2, w3 = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
+
+        # 融合
+        out = w1 * x1 + w2 * x2 + w3 * x3
+        out = self.out_proj(out)
+        return out
+
+
+class SplitFreq(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.dwt = DWTForward(wave='haar')
+        self.conv_low = Conv(c1, c2, 1, 1)
+        self.conv_high = Conv(3 * c1, c2, 1, 1)
+    def forward(self, x):
+        if isinstance(x, tuple):
+            x = x[1]
+        LL, yh = self.dwt(x)
+        LH, HL, HH = yh[0][:, :, 0], yh[0][:, :, 1], yh[0][:, :, 2]
+        low = self.conv_low(LL)
+        high = self.conv_high(torch.cat([LH, HL, HH], dim=1))
+        return (high, low)
+
+
+# class SplitFreq(nn.Module):
+#     """
+#     多头频率分离模块（2D）
+#     将输入通道分成 num_heads 组，每组独立进行小波变换和频带处理，最后融合。
+#     输入: x (B, C, H, W)
+#     输出: (B, C2, H/2, W/2)
+#     """
+#     def __init__(self, c1, c2, num_heads=4, wavelet='haar'):
+#         super().__init__()
+#         assert c1 % num_heads == 0, "c1 must be divisible by num_heads"
+#         assert c2 % num_heads == 0, "c2 must be divisible by num_heads"
+#         self.num_heads = num_heads
+#         self.head_dim = c1 // num_heads
+#         self.out_head_dim = c2 // num_heads
+
+#         # 为每个头创建独立的小波变换和 1x1 卷积
+#         self.dwt_list = nn.ModuleList([DWTForward(wave=wavelet) for _ in range(num_heads)])
+#         self.conv_low_list = nn.ModuleList([nn.Conv2d(self.head_dim, self.out_head_dim, 1) for _ in range(num_heads)])
+#         # 高频子带拼接后通道数为 3 * head_dim
+#         self.conv_high_list = nn.ModuleList([nn.Conv2d(3 * self.head_dim, self.out_head_dim, 1) for _ in range(num_heads)])
+
+#     def forward(self, x):
+#         if isinstance(x, tuple):
+#             x = x[1]
+
+#         B, C, H, W = x.shape
+#         # 按通道分组
+#         xs = x.chunk(self.num_heads, dim=1)   # 每个元素 (B, head_dim, H, W)
+
+#         low_outs = []
+#         high_outs = []
+
+#         for i in range(self.num_heads):
+#             xi = xs[i]
+#             # 小波变换
+#             LL, yh = self.dwt_list[i](xi)
+#             # yh[0] 包含三个高频子带: LH, HL, HH，每个形状 (B, head_dim, H/2, W/2)
+#             LH, HL, HH = yh[0][:, :, 0], yh[0][:, :, 1], yh[0][:, :, 2]
+#             high_feats = torch.cat([LH, HL, HH], dim=1)   # (B, 3*head_dim, H/2, W/2)
+
+#             low_out = self.conv_low_list[i](LL)
+#             high_out = self.conv_high_list[i](high_feats)
+
+#             low_outs.append(low_out)
+#             high_outs.append(high_out)
+
+#         # 将所有头的低频和高频分别拼接，然后相加（也可选择拼接后过 1x1 卷积等）
+#         low_total = torch.cat(low_outs, dim=1)    # (B, c2, H/2, W/2)
+#         high_total = torch.cat(high_outs, dim=1)  # (B, c2, H/2, W/2)
+#         out = low_total + high_total
+#         return out
+
+
+class UPFusion(nn.Module):
+    def __init__(self, c1, c2, c3):
+        super().__init__()
+        # Conv()
+        self.HL_conv = nn.Conv2d(c1, c2, (3,1), padding=(1,0))
+        self.LH_conv = nn.Conv2d(c1, c2, (1,3), padding=(0,1))
+        self.HH_conv = nn.Conv2d(c1, c2, (3,3), padding=1)
+        self.bn1 = nn.BatchNorm2d(c2)
+        self.bn2 = nn.BatchNorm2d(c2)
+        self.bn3 = nn.BatchNorm2d(c2)
+        self.idwt = DWTInverse(wave='haar')
+        self.conv_fuse = Conv(c2, c3, 3, 1, 1)  
+    def forward(self, x):
+        high, low_x = x
+        LH = F.silu(self.bn1(self.LH_conv(high)))
+        HL = F.silu(self.bn2(self.HL_conv(high)))
+        HH = F.silu(self.bn3(self.HH_conv(high)))
+        LL = low_x[1]
+        yh = [torch.stack([LH, HL, HH], dim=2)]
+        # print(LH.shape, HL.shape, HH.shape)
+        idwt = self.idwt((LL, yh))
+        # print(idwt.shape)
+        out = self.conv_fuse(idwt)
+        # print(out.shape)
+        return out
+    
+class UpFuseBlockV2(nn.Module):
+    def __init__(self, c, scale=2, k_up=3, reduction=4):
+        super().__init__()
+
+        self.scale = scale
+        self.k_up = k_up
+        hidden = max(c // reduction, 16)
+
+        # 1️⃣ 通道压缩（降计算）
+        self.comp = nn.Conv2d(c, hidden, 1)
+
+        # 2️⃣ kernel预测
+        self.encoder = nn.Conv2d(
+            hidden,
+            (scale ** 2) * (k_up ** 2),
+            3,
+            padding=1
+        )
+
+        # 3️⃣ 通道注意力
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, c // 4, 1),
+            nn.ReLU(),
+            nn.Conv2d(c // 4, c, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+
+        # 通道重标定
+        x = x * self.se(x)
+
+        # kernel 预测
+        kernel = self.comp(x)
+        kernel = self.encoder(kernel)
+
+        kernel = F.pixel_shuffle(kernel, self.scale)
+        kernel = kernel.view(
+            B,
+            self.k_up * self.k_up,
+            H * self.scale,
+            W * self.scale
+        )
+        kernel = F.softmax(kernel, dim=1)
+
+        # unfold
+        x_unfold = F.unfold(
+            x,
+            self.k_up,
+            padding=self.k_up // 2
+        )
+
+        x_unfold = x_unfold.view(
+            B,
+            C,
+            self.k_up * self.k_up,
+            H,
+            W
+        )
+
+        x_unfold = x_unfold.repeat_interleave(
+            self.scale,
+            dim=3
+        ).repeat_interleave(
+            self.scale,
+            dim=4
+        )
+
+        out = torch.sum(
+            x_unfold * kernel.unsqueeze(1),
+            dim=2
+        )
+
+        return out + F.interpolate(x, scale_factor=2, mode='bilinear')
+# class UpFuseBlockV2(nn.Module):
+#     def __init__(self, c_high, c_low, c_out, scale=2):
+#         super().__init__()
+
+#         # 上采样
+#         self.up = CARAFEPlus(c_high, scale=scale)
+
+#         # 通道对齐
+#         self.align_high = nn.Conv2d(c_high, c_out, 1, bias=False)
+#         self.align_low = nn.Conv2d(c_low, c_out, 1, bias=False)
+
+#         # 可学习权重（BiFPN风格）
+#         self.w = nn.Parameter(torch.ones(2))
+
+#         # 融合卷积
+#         self.fuse = nn.Sequential(
+#             nn.Conv2d(c_out, c_out, 3, padding=1, bias=False),
+#             nn.BatchNorm2d(c_out),
+#             nn.SiLU()
+#         )
+
+#         # 轻量空间注意力
+#         self.spatial_att = nn.Sequential(
+#             nn.Conv2d(c_out, 1, 3, padding=1),
+#             nn.Sigmoid()
+#         )
+
+#     def forward(self, x):
+
+#         x_high, x_low = x[0], x[1]
+#         # 上采样
+#         x_high = self.up(x_high)
+
+#         # 通道对齐
+#         x_high = self.align_high(x_high)
+#         x_low = self.align_low(x_low)
+
+#         # 权重归一化
+#         w = torch.relu(self.w)
+#         w = w / (w.sum() + 1e-6)
+
+#         # 加权融合（不再concat）
+#         x = w[0] * x_high + w[1] * x_low
+
+#         # 卷积融合
+#         x = self.fuse(x)
+
+#         # 空间注意力
+#         att = self.spatial_att(x)
+#         x = x * att + x  # 残差式注意力
+#         # print(x.shape)
+#         return x
+class SPDConv(nn.Module):
+    """
+    Space-to-Depth Downsampling Conv
+    """
+    def __init__(self, c1, c2, k=3):
+        super().__init__()
+
+        self.spd = nn.PixelUnshuffle(2)  # space-to-depth
+        self.conv = nn.Conv2d(c1 * 4, c2, k, padding=k // 2, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        x = self.spd(x)
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
 class DFL(nn.Module):
     """
     Integral module of Distribution Focal Loss (DFL).
@@ -228,9 +779,13 @@ class C2f(nn.Module):
 
     def forward(self, x):
         """Forward pass through C2f layer."""
+        if isinstance(x, tuple):
+            x, _ = x
         y = list(self.cv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
-        return self.cv2(torch.cat(y, 1))
+        out = self.cv2(torch.cat(y, 1))
+        # print(out.shape)
+        return out
 
     def forward_split(self, x):
         """Forward pass using split() instead of chunk()."""
@@ -335,6 +890,19 @@ class Bottleneck(nn.Module):
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, k[0], 1)
         self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        """'forward()' applies the YOLO FPN to input data."""
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+class SplitBottleneck(nn.Module):
+    """Split bottleneck."""
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Dconv(c_, c2, k[1], 1, act=g)
+        # self.cv2 = Conv(c_, c2, k[1], 1, g=g)
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
@@ -766,6 +1334,7 @@ class C2fCIB(C2f):
         """
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(CIB(self.c, self.c, shortcut, e=1.0, lk=lk) for _ in range(n))
+        # print("Using CIB in C2fCIB", n)
 
 
 class Attention(nn.Module):

@@ -49,7 +49,16 @@ from .block import (
     PSA,
     C2fCIB,
     SCDown,
-    RepVGGDW
+    RepVGGDW,
+    FSSB,
+    UpFuseBlockV2,
+    SPDConv,
+    SplitFreq,
+    UPFusion,
+    ASFF,
+    ESCFFM,
+    SobelConv,
+    FreqASFF
 )
 from .conv import (
     CBAM,
@@ -143,5 +152,12 @@ __all__ = (
     "C2fCIB",
     "SCDown",
     "RepVGGDW",
-    "v10Detect"
+    "v10Detect",
+    "FSSB",
+    "UpFuseBlockV2",
+    "SPDConv"
+    "SplitFreq",
+    "ASFF",
+    "ESCFFM",
+    "FreqASFF"
 )

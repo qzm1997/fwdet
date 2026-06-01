@@ -509,6 +509,8 @@ class v10Detect(Detect):
         self.one2one_cv3 = copy.deepcopy(self.cv3)
     
     def forward(self, x):
+        # for xi in x:
+        #     print(xi.shape)
         one2one = self.forward_feat([xi.detach() for xi in x], self.one2one_cv2, self.one2one_cv3)
         if not self.export:
             one2many = super().forward(x)

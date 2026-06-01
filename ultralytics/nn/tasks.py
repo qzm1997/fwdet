@@ -53,7 +53,15 @@ from ultralytics.nn.modules import (
     PSA,
     SCDown,
     RepVGGDW,
-    v10Detect
+    v10Detect,
+    FSSB,
+    UpFuseBlockV2,
+    SPDConv,
+    SplitFreq,
+    UPFusion,
+    ASFF,
+    ESCFFM,
+    FreqASFF
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -888,9 +896,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             RepC3,
             PSA,
             SCDown,
-            C2fCIB
+            C2fCIB,
         }:
             c1, c2 = ch[f], args[0]
+            # print(args)
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
             if m is C2fAttn:
@@ -918,6 +927,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
+            # for i in f:
+            #     print(f)
+            # for c in ch:
+            #     print(c) 
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
@@ -929,6 +942,51 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
+        elif m is UpFuseBlockV2:
+            c1 = ch[f[0]]
+            c2 = ch[f[1]]
+            c3 = args[0]
+            # c1, c2 = ch[f], args[0]
+            # print(args)
+            if c3 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                c3 = make_divisible(min(c3, max_channels) * width, 8)
+
+            # args = [c1, c2, *args[1:]]
+            args = [c1, c2, c3]
+        elif m is SplitFreq:
+            c1 = ch[f]
+            c2 = args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+        elif m is ASFF:
+            c2 = args[-1]
+            z = args[1]
+            # print(ch)
+            # c = 
+            args = [args[0], [make_divisible(min(c2, max_channels) * width, 8) for c2 in z], c2]
+        elif m is FSSB:
+            # c1 = ch[f[0]]
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+        elif m is FreqASFF:
+            c2 = args[-1]
+            z = args[1]
+            args = [[make_divisible(min(c, max_channels) * width, 8) for c in z], c2]
+
+        elif m is UPFusion:
+            c1 = ch[f[0]] #512
+            c2 = ch[f[1]] #512
+            c3 = args[0] # 512
+            c3 = make_divisible(min(c3, max_channels) * width, 8)
+            # c3 = args[0]
+            args = [c1, c2, c3]
+        elif m is ESCFFM:
+            c1 = ch[f]
+            c2 = args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
         else:
             c2 = ch[f]
 

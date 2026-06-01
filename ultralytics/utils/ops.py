@@ -206,13 +206,16 @@ def non_max_suppression(
             shape (num_boxes, 6 + num_masks) containing the kept boxes, with columns
             (x1, y1, x2, y2, confidence, class, mask1, mask2, ...).
     """
-
+    if isinstance(prediction, dict):
+        # YOLOv10 输出字典包含 'one2many' 和 'one2one' 键，提取核心检测张量
+        # 优先使用 one2one 分支（主流检测结果），也可根据需求用 one2many
+        prediction = prediction.get('one2one', prediction.get('one2many'))
     # Checks
     assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
     assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
     if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
         prediction = prediction[0]  # select only inference output
-
+    # print(f"prediction shape before NMS: {prediction.keys()}")
     bs = prediction.shape[0]  # batch size
     nc = nc or (prediction.shape[1] - 4)  # number of classes
     nm = prediction.shape[1] - nc - 4
